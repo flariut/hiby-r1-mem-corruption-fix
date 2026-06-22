@@ -322,7 +322,8 @@ that already has this patch applied is provided in [section 9](#9-prebuilt-firmw
 
 ## 9. Prebuilt firmware image
 
-For convenience, a ready-to-flash image with the fix already applied is included:
+For convenience, a ready-to-flash image with the fix already applied is published on the
+repository's [Releases page](../../releases/latest):
 
 **`r1-1.7b1-mod-coverfix.upt`**
 
@@ -338,7 +339,7 @@ else. It is built from HiBy's own `1.7b1` release; it is not a from-scratch ROM.
 | :--- | :--- | :--- |
 | **Album-art crash patch** | Applied | The single-instruction source fix from this repository (sections 4–6). This is the whole point of the image. |
 | **Cover image cache** (`tf_image_cache_enable`) | **Off** | The cache was only ever a *workaround* that hid the crash by skipping decodes. With the bug actually fixed it is no longer needed, and leaving it off keeps RAM pressure and SD writes down. |
-| **Music library / database** (`tf_music_db_enable`) | **On** | Enables the tag-based library (browse by album, artist, and so on), which is the cover-grid experience this whole investigation was about. |
+| **Music database on the card** (`tf_music_db_enable`) | **On** | This only **makes the option available** in the player's settings; it does not move the database by itself. With it enabled you can choose, in the UI, to store the scanned music database (`usrlocal_media.db`) on the microSD card instead of internal storage. If you never enable it in the UI, nothing changes. It does not turn the library feature on or off; it only exposes where the index can live. |
 | **UI font** | MiSans (`MiSans.ttf`) | So album and track titles with non-ASCII characters (CJK, accented Latin, and similar) render correctly instead of as boxes. This is inherited from the `1.7b1-mod` base. |
 
 ### What is deliberately NOT in it
@@ -354,8 +355,8 @@ crash dump. Specifically, it does **not** contain:
   before reboot. None of that is here.
 - **adb / USB debugging changes.** Nothing in this image enables adb.
 
-In other words: stock `1.7b1`, plus the MiSans font, plus the crash fix, plus the music library
-on and the cover cache off. No logging, no debug hooks, no adb.
+In other words: stock `1.7b1`, plus the MiSans font, plus the crash fix, with the music database
+kept on the card and the cover cache off. No logging, no debug hooks, no adb.
 
 ### Building this image yourself
 
