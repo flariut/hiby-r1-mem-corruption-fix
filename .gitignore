@@ -1,0 +1,2 @@
+# Firmware images are distributed as GitHub release assets, not tracked in the tree.
+*.upt

@@ -405,10 +405,17 @@ Everything above this point is observed on-device or verified by the patch. This
 one part that is conjecture: a plausible reconstruction of the C that would produce the observed
 behaviour, offered to help locate the code, not as a claim about the actual source.
 
-A clarification on what is and is not proven. The equality of `result[+4]` and `result[+8]` on
-failure proves the file size is written into both fields and that the pointer is only overwritten
-on success. It does **not** by itself prove a `union`. A union is simply the tidiest idiom that
-produces the same bytes; two ordinary fields both assigned the file size compile to the same thing.
+A clarification on what is and is not proven. The intuitive first guess for a bug like this is a C
+`union`: a single slot that overlaps the size and the pointer in the *same* memory, so that
+forgetting to overwrite it leaves the size readable as a pointer. The on-device evidence rules that
+out. The size sits at offset `+4` and the pointer at `+8` — two distinct slots, four bytes apart —
+whereas a union would place them at the *same* offset. So the reuse is **temporal, not spatial**:
+slot `+8` is seeded with the size and is only overwritten by the real pointer on the success path
+(the struct below models exactly this, with separate `+4` and `+8` fields and no union). The
+equality of `result[+4]` and `result[+8]` on failure therefore proves the file size is written into
+both fields and that the pointer is overwritten only on success; it does **not** by itself prove a
+union. A union is simply the tidiest idiom that would produce the same bytes; two ordinary fields
+both assigned the file size compile to the same thing.
 
 ```c
 struct ImageDecodeResult {
