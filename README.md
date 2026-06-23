@@ -23,6 +23,7 @@ source-locating clues are the symbol strings and struct offsets in section 7.
 
 ## Table of contents
 
+- [Evidence status — proven vs. empirical vs. conjecture](#evidence-status--proven-vs-empirical-vs-conjecture)
 1. [What you see as a user](#1-what-you-see-as-a-user)
 2. [The investigation](#2-the-investigation)
 3. [Crash evidence (kernel register dump)](#3-crash-evidence-kernel-register-dump)
@@ -35,6 +36,59 @@ source-locating clues are the symbol strings and struct offsets in section 7.
 10. [Address anchors (version-specific)](#10-address-anchors-version-specific)
 11. [Appendix A — conjectured source logic](#appendix-a--conjectured-source-logic)
 12. [Appendix B — recommended source-level fixes](#appendix-b--recommended-source-level-fixes)
+
+---
+
+## Evidence status — proven vs. empirical vs. conjecture
+
+This writeup deliberately separates three tiers of certainty. Read every claim in light of which
+tier it sits in; the body text is tagged accordingly.
+
+**Evidence-backed (hard).** Verified directly from the stripped binary — radare2 disassembly and
+the Ghidra decompiler (`r2ghidra` / `pdg`) — and from the kernel register dump:
+
+- **The fault.** `0x0045850c  lw a0, 0x50(s1)` dereferences `s1 = 0x7bbf6`, a value below the
+  user-space base `0x00400000` → SIGSEGV. *(register dump)*
+- **The propagation.** `s1` is `item+8`, loaded by the caller at `0x00436704  lw a0, 8(item)` and
+  passed to the draw routine, which dereferences it. The caller's **only** guard on `item+8` is
+  `== 0` (`0x004366a8  beqz`); there is no range or type check, and the draw routine validates
+  nothing. *(disassembly)*
+- **The store.** `item+8` is written by the copy at `0x0042827c`. Decompiled, that copy is
+  `item.{+4,+8,+0xc,+0x10} = cover.{[1],[2],[3],[4]}` — a four-field struct copy that does not
+  validate the pointer field. *(Ghidra)*
+- **It is not the file size.** `0x7bbf6 = 506,870` is far larger than any compressed cover:
+  measured across the test library, the largest cover is 129,799 bytes and none is within
+  hundreds of KB of this value. *(measurement)*
+- **The blamed allocator is innocent.** The decode/scale bitmap allocator `0x0043d560` is
+  **clean** — it frees and returns NULL on allocation failure, and stores a *width* (≤ 65535,
+  not a pointer) at `+8`. It cannot produce a non-null bad struct. *(Ghidra — this corrects
+  earlier drafts, including a separate AI analysis, that blamed this routine.)*
+- **The real producer is virtual.** The struct that is copied comes from a runtime virtual call:
+  `0x004409e0` wraps `(*(obj+0x2c))(obj, …)` with `obj = *0x8ce0ec`, a BSS / runtime-initialised
+  global. The producing assignment is therefore **not reachable by static analysis**. *(Ghidra +
+  symbol table)*
+
+**Empirical (behavioral).** Established by the patched firmware's behaviour on-device, *not* by
+reading instructions:
+
+- On a failed decode, `cover[+4] == cover[+8]`; on a success they differ. The fix gates purely on
+  `+4 == +8`, and it both stops every crash **and** never blanks a valid cover — which a wrong
+  signature could not do simultaneously. This is strong but indirect, and **cannot currently be
+  proven statically**, because the producing code is behind the runtime virtual dispatch above.
+- "No reboots since" is consistent with a correct fix, but on its own is also consistent with luck
+  on a rare trigger. The signature argument above is what makes it more than luck — not the uptime.
+
+**Conjecture / assumption (labelled as such wherever it appears).**
+
+- *What* the shared `+4`/`+8` value is. Its ~½ MB magnitude is consistent with a **decoded** image
+  buffer size (a failed `malloc` argument), not the compressed file — but the exact quantity is not
+  pinned, and the producer is not statically reachable, so this stays a conjecture.
+- The reconstructed C in [Appendix A](#appendix-a--conjectured-source-logic). It models the observed
+  behaviour; it is **not** claimed to be the actual source.
+
+The decisive way to promote the empirical item to hard evidence is a runtime probe: a diagnostic
+hook at `0x0042827c` that records `+4`/`+8` through the same kernel-dump mechanism that produced the
+original crash log. Static disassembly alone cannot reach the producer.
 
 ---
 
@@ -141,25 +195,42 @@ descriptor into the list-item structure. The relevant store block:
 0x00428288  sw v1, 0x10(v0)   ; item[+0x10] = result[+0x10]
 ```
 
-The only guard before this copy is `result (s3) != NULL`. The field `result[+8]` itself is never
-validated. When the decode fails part-way, `result` is a valid (non-null) struct, but `result[+8]`
-holds a non-pointer integer rather than a real buffer pointer. That value is copied into `item[+8]`,
-and the renderer later executes the fatal `lw a0, 0x50(item[+8])` at `0x0045850c`.
+Decompiled (Ghidra), the copy is unambiguous — a four-field struct copy with no validation:
 
-Where the bad value originates (inference, not proven to a single instruction): the value is
-produced upstream in the decode/scale path, which on this device fails when a working-buffer
-allocation cannot be satisfied under memory pressure. The observed behaviour is consistent with a
-failure path that returns *without* nulling the image-buffer field, leaving a non-pointer value in
-`result[+8]`. We confirmed by disassembly that one sibling allocator (the embedded-bitmap
-constructor) *does* free and return NULL on allocation failure, so the buggy path is a localised
-deviation, not the codebase's general pattern. We did not isolate the exact producing instruction
-(see Appendix A); the proven defect is the **missing validation of `result[+8]` in the parser**
-before it is copied into the list item.
+```c
+// fcn.00427ee0 (album_cover_parser); arg1 = parser "this", puVar24 = the cover struct
+if ((*(arg1 + 0x530) == 0) && (*(arg1 + 0x538) != 0)) {     // item = arg1[0x538]
+    *(*(arg1 + 0x538) + 0xc)  = puVar24[3];
+    *(*(arg1 + 0x538) + 8)    = puVar24[2];   // item+8  = cover[+8]   <-- the bug
+    *(*(arg1 + 0x538) + 0x10) = puVar24[4];
+    *(*(arg1 + 0x538) + 4)    = puVar24[1];   // item+4  = cover[+4]
+}
+```
+
+The only guard before this copy is `cover (puVar24) != NULL`. The field `cover[+8]` itself is never
+validated. When the decode fails part-way, `cover` is a valid (non-null) struct, but `cover[+8]`
+holds a non-pointer integer rather than a real buffer pointer. That value is copied into `item[+8]`,
+and the renderer later executes the fatal `lw a0, 0x50(item[+8])` at `0x0045850c`. **This — the
+unvalidated copy of `cover[+8]` into the list item — is the proven defect.**
+
+**Where the bad value originates (not statically resolvable).** Earlier drafts of this document
+(and a separate AI-assisted analysis) blamed the visible decode/scale chain
+(`0x00427e40 → 0x00427a40 → 0x0043d560`) for "forgetting to null the field." Decompilation
+disproves that: `0x0043d560` frees and returns **NULL** on allocation failure, and its `+8` is a
+*width* (≤ 65535), not a pointer — so it cannot be the source of a non-null bad struct, and it is
+not even the struct that gets copied. The struct that *is* copied (`puVar24`) is produced by a
+**runtime virtual call** — `0x004409e0` invokes `(*(obj+0x2c))(obj, …)` where `obj = *0x8ce0ec`, a
+BSS / runtime-initialised global. Because the target is a function pointer set at runtime, **the
+producing assignment cannot be reached by static disassembly.** What we can state as fact is the
+defect at the consumer (`0x0042827c`); the producer-side detail (see [Appendix A](#appendix-a--conjectured-source-logic))
+is conjecture until captured at runtime.
 
 Two guards should have caught this and both miss it:
 
-1. the renderer checks the cover pointer for `== 0`, but the bad value is non-zero;
-2. the decode path does not null the image-buffer field on allocation failure.
+1. **(proven)** the renderer checks the cover pointer for `== 0` (`0x004366a8`), but the bad value
+   is non-zero, so it sails through and is dereferenced;
+2. **(inferred)** the producing path leaves a non-pointer value in `cover[+8]` on failure instead of
+   NULL — consistent with the evidence, but not provable statically because that path is virtual.
 
 ---
 
@@ -211,18 +282,21 @@ platform maps shared libraries and dynamic heaps/memory pools in the low user-sp
 structures live there too. The `result[+4] == result[+8]` comparison is robust: it keys on the
 actual failure signature, not on an address range.
 
-**What the fix demonstrates.** The hook gates purely on `result[+4] == result[+8]`. It both stops
-every crash and never blanks a successfully decoded cover. That proves two concrete facts about the
-failure path:
+**What the fix demonstrates (empirical, not a static proof).** The hook gates purely on
+`cover[+4] == cover[+8]`. It both stops every crash and never blanks a successfully decoded cover.
+A wrong signature could not do both at once — too narrow and crashes would continue; too broad and
+valid covers would blank. So the behaviour is strong evidence for two facts about the failure path:
 
-- on a **failed** decode, `result[+4]` and `result[+8]` hold the **same** value; and
-- on a **successful** decode they **differ** (`result[+8]` is a real pointer, e.g. `0x00ee6b58`).
+- on a **failed** decode, `cover[+4]` and `cover[+8]` hold the **same** value; and
+- on a **successful** decode they **differ** (`cover[+8]` is a real pointer, e.g. `0x00ee6b58`).
 
-In other words, on the failure path the image-pointer field `+8` is left holding the same
-non-pointer value as `+4`, and is overwritten by the real buffer pointer only on success. What that
-shared value *is* — a size, a length, a scratch quantity — is not proven; that it is a non-pointer
-value left in the pointer slot on failure is (sections 3–4). Its magnitude (~½ MB) is consistent
-with a decoded image buffer and rules out the compressed cover file.
+This is **empirical, not proven from the instructions.** The code that writes `cover[+4]` and
+`cover[+8]` is behind a runtime virtual dispatch (`0x004409e0 → *(obj+0x2c)`, see section 4), so the
+equality cannot be confirmed statically — only by the fix's behaviour, or by a runtime probe. What
+the shared value *is* — a size, a length, a scratch quantity — is likewise not proven; its magnitude
+(~½ MB) is consistent with a decoded image buffer and rules out the compressed cover file, but that
+remains a conjecture (Appendix A). The hard, instruction-level facts are the fault, the unvalidated
+copy, and the `== 0`-only guard (sections 3–4); the `+4 == +8` *signature* is empirical.
 
 ### A note on hook placement (the cause of an early boot loop)
 
@@ -404,10 +478,13 @@ For `1.7b1` only. These are reference points; the patch does not depend on them.
 | VA | Role |
 | :--- | :--- |
 | `0x0045850c` | crash instruction `lw a0,0x50(s1)` in the image-draw routine `0x004584c0` |
-| `0x00436660` | album-list renderer (the immediate caller, `ra=0x436710`); contains the `coverPtr==0` guard |
-| `0x00427ee0` | `album_cover_parser`; the unchecked store is at `0x0042827c` |
-| `0x00427e40` -> `0x00427a40` | cover decode/scale; the working-buffer alloc that fails under low RAM |
+| `0x00436660` | album-list renderer (the immediate caller, `ra=0x436710`); the `coverPtr==0` guard is at `0x004366a8` |
+| `0x00427ee0` | `album_cover_parser`; the unchecked struct copy is at `0x0042827c` |
+| `0x004409e0` | the actual cover-struct producer — a lock/unlock wrapper around the **virtual call** `(*(obj+0x2c))(obj,…)`, `obj = *0x8ce0ec` (BSS, runtime-init); not statically resolvable |
+| `0x0043d560` | decode/scale bitmap allocator — **clean** (NULL on failure, `+8`=width); *not* the culprit, despite earlier drafts |
+| `0x00427e40` -> `0x00427a40` | the visible decode/scale chain (calls `0x0043d560`); investigated and ruled out as the producer |
 | `0x00466c20` / `0x00466bc0` | app `malloc` / `free` wrappers |
+| `0x008ce0ec` / `0x008ce0f4` | global cover-manager object pointer / its lock (runtime-initialised) |
 
 ---
 
@@ -416,6 +493,15 @@ For `1.7b1` only. These are reference points; the patch does not depend on them.
 Everything above this point is observed on-device or verified by the patch. This appendix is the
 one part that is conjecture: a plausible reconstruction of the C that would produce the observed
 behaviour, offered to help locate the code, not as a claim about the actual source.
+
+> **Why this stays conjecture.** The code that writes `cover[+4]` and `cover[+8]` is reached through
+> a runtime virtual call (`0x004409e0 → *(obj+0x2c)`, `obj = *0x8ce0ec`; see section 4). The target
+> is a function pointer set at runtime, so the producing routine is **not reachable by static
+> disassembly** — we cannot point at the instruction that seeds `+8`. The model below is therefore a
+> behavioural reconstruction, not a located function. (Note: a separate AI-assisted pass claimed to
+> have found this code with "100% hard evidence" at `0x004276e0`/`0x0042ec64`; on inspection those
+> are two *unconnected* functions with an unverified value label — not the producer. Treat any such
+> static "proof" of the producer with suspicion until it is confirmed at runtime.)
 
 > **One correction up front.** Earlier drafts of this writeup called the faulting value
 > "the compressed JPEG file size." That has since been **disproven by measurement**: the largest
@@ -517,15 +603,20 @@ is the case where the better-engineered code is also the cheaper code.
 
 ## Appendix B — recommended source-level fixes
 
-In priority order, for a proper upstream fix:
+In priority order, for a proper upstream fix. (Item 1 names the producer generically because, as
+section 4 shows, its exact location is behind a runtime virtual dispatch and not reachable from the
+stripped binary — HiBy's engineers can find it from the source via the symbol clues in section 7.)
 
-1. **In the decoder/scaler:** on every allocation or decode failure, set the result's image-buffer
-   field to NULL (or free and NULL the whole descriptor) before returning. This is the true root
-   fix and makes every consumer safe.
-2. **In `album_cover_parser`:** validate `result[+8]` (not just `result != NULL`) before assigning
-   it to the list item, and treat an invalid pointer as "no cover".
-3. **Check the decode/scale allocation return explicitly.** The working-buffer allocation can and
-   does fail on this hardware. Propagate a clean failure.
+1. **In the cover-struct producer** (the method behind the virtual call at `*0x8ce0ec + 0x2c`,
+   invoked via `0x004409e0`): on every allocation or decode failure, set the image-buffer field
+   (`+8`) to NULL — or free and NULL the whole struct — before returning. This is the true root fix
+   and makes every consumer safe.
+2. **In `album_cover_parser` (`0x0042827c`):** validate `cover[+8]` (not just `cover != NULL`)
+   before assigning it to the list item, and treat an invalid pointer as "no cover". This is exactly
+   where the binary patch in this repo acts.
+3. **Check every decode/allocation return explicitly.** Working-buffer allocations can and do fail
+   on this hardware (~12 MB free). Note that the *sibling* allocator `0x0043d560` already does this
+   correctly (frees and returns NULL) — the producing path should match it.
 4. **Defensive:** the renderer already skips `coverPtr == 0`. Widen it to also skip pointers below
    the user-space text base `0x00400000`.
 5. **Telemetry:** the in-process SIGSEGV/SIGBUS handlers currently mask faults like this from crash
