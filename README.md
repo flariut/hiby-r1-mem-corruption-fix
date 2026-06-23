@@ -111,13 +111,16 @@ Reading the dump:
 
 - `epc = 0x0045850c` is the instruction `lw a0, 0x50(s1)` inside the image-draw routine.
 - `s1 = a0 = 0x0007bbf6` is the value being used as the image pointer.
-- `0x0007bbf6 = 506,870`, **the exact byte size of the cover JPEG being loaded at that moment.**
-  The compressed file size is sitting where the decoded-image pointer should be.
+- `0x0007bbf6 = 506,870` is a plain integer, not a valid address. It is **far too large to be the
+  compressed cover file** — measured across the test library, the largest cover on the card is
+  ~130 KB and none is anywhere near 506 KB — and it sits in the size range of a *decoded* image
+  buffer. Its exact provenance is not proven; what is certain is that a non-pointer number occupies
+  the slot where the decoded-image pointer belongs.
 - `0x7bbf6 < 0x00400000` (below the MIPS user text base), so the load address-faults
   (`ExcCode 04`, address error on load; `BadVA = s1 + 0x50`).
 
-The faulting address being equal to a file size, rather than a plausible heap address, is the
-whole case in one line: the renderer is dereferencing a number that was never a pointer.
+The faulting address being a small integer rather than a plausible heap address is the whole case
+in one line: the renderer is dereferencing a number that was never a pointer.
 
 ---
 
@@ -140,14 +143,18 @@ descriptor into the list-item structure. The relevant store block:
 
 The only guard before this copy is `result (s3) != NULL`. The field `result[+8]` itself is never
 validated. When the decode fails part-way, `result` is a valid (non-null) struct, but `result[+8]`
-holds the JPEG file size rather than a real buffer pointer. That value is copied into `item[+8]`,
+holds a non-pointer integer rather than a real buffer pointer. That value is copied into `item[+8]`,
 and the renderer later executes the fatal `lw a0, 0x50(item[+8])` at `0x0045850c`.
 
-Where the bad value originates: the decode/scale routine allocates its working buffer through the
-app's allocator wrapper and, on allocation failure, returns *without* setting the image-buffer
-field to NULL. Because the device is memory-constrained, this allocation genuinely fails in the
-field. The defect is a missing failure-path initialisation in the decoder, compounded by the
-missing validation in the parser.
+Where the bad value originates (inference, not proven to a single instruction): the value is
+produced upstream in the decode/scale path, which on this device fails when a working-buffer
+allocation cannot be satisfied under memory pressure. The observed behaviour is consistent with a
+failure path that returns *without* nulling the image-buffer field, leaving a non-pointer value in
+`result[+8]`. We confirmed by disassembly that one sibling allocator (the embedded-bitmap
+constructor) *does* free and return NULL on allocation failure, so the buggy path is a localised
+deviation, not the codebase's general pattern. We did not isolate the exact producing instruction
+(see Appendix A); the proven defect is the **missing validation of `result[+8]` in the parser**
+before it is copied into the list item.
 
 Two guards should have caught this and both miss it:
 
@@ -164,7 +171,8 @@ Two guards should have caught this and both miss it:
   `img_table` schema in section 7, which stores both `data` and `blurred_data` per cover). Under
   fast scrolling or the cold-boot library scan, concurrent decodes push free memory low and a
   decode-buffer allocation fails.
-- That allocation failure is the unchecked path that yields the file-size-as-pointer.
+- That allocation failure is the unchecked path that leaves a non-pointer value in the cover-pointer
+  field.
 - This is exactly why enabling the on-card image cache hides the crash: a cache *hit* skips
   decoding entirely, so the failing allocation never runs.
 
@@ -177,13 +185,13 @@ fall out of one fact: the decode buffer only fails to allocate when free RAM is 
 
 The defect can be neutralised at a single instruction: the store at `0x0042827c`. We redirect that
 store to a small validation hook placed in `.text` dead space. The hook compares the
-image-pointer field `result[+8]` against the size field `result[+4]` and, when they are equal,
+image-pointer field `result[+8]` against the companion field `result[+4]` and, when they are equal,
 writes 0 instead of the bad value:
 
 ```asm
 hook:
-    lw    t0, 4(s3)     ; result[+4]  (file size)
-    lw    t1, 8(s3)     ; result[+8]  (image pointer, or file size on a failed decode)
+    lw    t0, 4(s3)     ; result[+4]  (companion field; equal to +8 on a failed decode)
+    lw    t1, 8(s3)     ; result[+8]  (image pointer, or the leftover value on a failed decode)
     xor   t0, t0, t1    ; 0 iff the two fields are equal
     movz  t1, zero, t0  ; if equal (failed decode), force the pointer to 0
     sw    t1, 8(v0)     ; item[+8] = sanitised value
@@ -207,13 +215,14 @@ actual failure signature, not on an address range.
 every crash and never blanks a successfully decoded cover. That proves two concrete facts about the
 failure path:
 
-- on a **failed** decode, `result[+4]` and `result[+8]` hold the same value (the file size); and
-- on a **successful** decode they differ (`result[+4]` is the size, `result[+8]` is a real pointer,
-  e.g. `0x00ee6b58`).
+- on a **failed** decode, `result[+4]` and `result[+8]` hold the **same** value; and
+- on a **successful** decode they **differ** (`result[+8]` is a real pointer, e.g. `0x00ee6b58`).
 
-In other words, the file size is written into the image-pointer field during loading and is only
-overwritten by the real buffer pointer on the success path. The failure path returns without that
-overwrite.
+In other words, on the failure path the image-pointer field `+8` is left holding the same
+non-pointer value as `+4`, and is overwritten by the real buffer pointer only on success. What that
+shared value *is* — a size, a length, a scratch quantity — is not proven; that it is a non-pointer
+value left in the pointer slot on failure is (sections 3–4). Its magnitude (~½ MB) is consistent
+with a decoded image buffer and rules out the compressed cover file.
 
 ### A note on hook placement (the cause of an early boot loop)
 
@@ -273,10 +282,13 @@ CREATE TABLE img_table (path TEXT COLLATE NOCASE, width INT, height INT, rgb_bit
 
 Structure offsets observed (for cross-checking against the original structs):
 
-- **List item / row:** `size` at `+0x04`, image pointer at `+0x08` (the crash field), field at
+- **List item / row:** field at `+0x04`, image pointer at `+0x08` (the crash field), field at
   `+0x0c`, field at `+0x10`, "cover loaded" flag at `+0x53c` in the parser's `this`.
-- **Decode-result descriptor:** `data` at `[0]`/`+0`, `size` at `[1]`/`+4`, image-buffer pointer at
-  `[2]`/`+8` (the field left uninitialised on failure), then `+0xc` and `+0x10`.
+- **Decode-result descriptor:** `data` at `[0]`/`+0`, a field at `[1]`/`+4` (equal to `+8` on a
+  failed decode), image-buffer pointer at `[2]`/`+8` (holds a non-pointer value on failure), then
+  `+0xc` and `+0x10`. The `+4`/`+8` labels of "size" and "pointer" are inferred from the success
+  path and the sibling allocator; only the offsets and the failure-time equality are directly
+  observed.
 - **Image object dereferenced by the renderer:** pixel/data pointer at `+0x50` (the `lw a0,0x50(s1)`
   that faults).
 
@@ -405,35 +417,42 @@ Everything above this point is observed on-device or verified by the patch. This
 one part that is conjecture: a plausible reconstruction of the C that would produce the observed
 behaviour, offered to help locate the code, not as a claim about the actual source.
 
+> **One correction up front.** Earlier drafts of this writeup called the faulting value
+> "the compressed JPEG file size." That has since been **disproven by measurement**: the largest
+> cover on the test device is ~130 KB, while the faulting value is 506,870 bytes (~½ MB). Its
+> magnitude instead matches a *decoded* image buffer (e.g. a few hundred pixels square at 2–3
+> bytes/pixel). The exact quantity is not proven, so below it is referred to as a "size-class value"
+> rather than a file size.
+
 A clarification on what is and is not proven. The intuitive first guess for a bug like this is a C
 `union`: a single slot that overlaps the size and the pointer in the *same* memory, so that
-forgetting to overwrite it leaves the size readable as a pointer. The on-device evidence rules that
-out. The size sits at offset `+4` and the pointer at `+8` — two distinct slots, four bytes apart —
-whereas a union would place them at the *same* offset. So the reuse is **temporal, not spatial**:
-slot `+8` is seeded with the size and is only overwritten by the real pointer on the success path
+forgetting to overwrite it leaves the number readable as a pointer. The on-device evidence rules that
+out. The two fields sit at offsets `+4` and `+8` — two distinct slots, four bytes apart — whereas a
+union would place them at the *same* offset. So the reuse is **temporal, not spatial**: slot `+8` is
+seeded with the size-class value and is only overwritten by the real pointer on the success path
 (the struct below models exactly this, with separate `+4` and `+8` fields and no union). The
-equality of `result[+4]` and `result[+8]` on failure therefore proves the file size is written into
-both fields and that the pointer is overwritten only on success; it does **not** by itself prove a
-union. A union is simply the tidiest idiom that would produce the same bytes; two ordinary fields
-both assigned the file size compile to the same thing.
+equality of `result[+4]` and `result[+8]` on failure therefore shows the same value lands in both
+fields and that the pointer is overwritten only on success; it does **not** by itself prove a union.
+A union is simply the tidiest idiom that would produce the same bytes; two ordinary fields both
+assigned the same value compile to the same thing.
 
 ```c
 struct ImageDecodeResult {
-    void *rawCompressedData; // +0
-    int   size;              // +4   file size
-    void *decodedDataPtr;    // +8   set on success; left holding the file size on failure
+    void *rawData;           // +0
+    int   size;              // +4   a size-class value (magnitude ~ a decoded buffer; not proven)
+    void *decodedDataPtr;    // +8   set on success; left holding `size` on failure
     int   width;             // +0xc
     int   format;            // +0x10
 };
 
 bool decode_cover(const char *path, ImageDecodeResult *result) {
-    result->size           = get_file_size(path);   // +4
+    result->size           = result->width * result->height * bpp; // decoded-buffer byte count
     result->decodedDataPtr = (void *)result->size;  // +8 seeded with the size before decode
 
-    void *buffer = malloc(result->width * result->height * 2); // RGB565, 2 bytes/px (guess)
+    void *buffer = malloc(result->size);            // fails under memory pressure
     if (buffer == NULL) {
         // BUG: returns without setting result->decodedDataPtr = NULL,
-        // so +8 keeps the file size.
+        // so +8 keeps the size-class value.
         return false;
     }
     result->decodedDataPtr = buffer; // +8 overwritten only on success
@@ -445,16 +464,19 @@ void album_cover_parser(ListItem *item, const char *path) {
     decode_cover(path, &result);              // return value not checked
 
     item->size      = result.size;            // +4
-    item->coverPtr  = result.decodedDataPtr;  // +8  BUG: holds the file size on failure
+    item->coverPtr  = result.decodedDataPtr;  // +8  BUG: holds the size-class value on failure
     item->field_c   = result.width;           // +0xc
     item->field_10  = result.format;          // +0x10
 }
 ```
 
-The renderer later does `lw a0, 0x50(item->coverPtr)`; with `coverPtr` holding the file size
-(`0x7bbf6 = 506,870`, below `0x00400000`), the load faults and the process takes SIGSEGV.
+The renderer later does `lw a0, 0x50(item->coverPtr)`; with `coverPtr` holding the non-pointer
+value (`0x7bbf6 = 506,870`, below `0x00400000`), the load faults and the process takes SIGSEGV.
+(In this model the failed `malloc` and the seeded `+8` are the *same* size value, which is why
+`+4 == +8` on failure — consistent with the ~½ MB magnitude being a decoded-buffer size rather than
+the compressed file.)
 
-### A.1 — Why is the file size in the pointer field at all? (open question)
+### A.1 — Why is a non-pointer value in the pointer field at all? (open question)
 
 We can prove *what* happens (sections 4 and 6) but not *why the code was written to put a size
 there in the first place*. This is genuinely the least certain part, and the original authors will
